@@ -1,0 +1,94 @@
+name: Build TA-Lib wheels for Android ARM64
+
+on:
+  workflow_dispatch:
+
+env:
+  TALIB_C_VER: 0.6.4
+  TALIB_PY_VER: 0.6.8
+  NDK_VERSION: r26d                     # Android NDK 版本
+  API_LEVEL: 21                          # 最低支持的 Android API 级别
+  TARGET: aarch64-linux-android           # 目标三元组 (ARM64)
+  ANDROID_ABI: arm64-v8a                  # Android ABI 名称
+
+jobs:
+  build_android_arm64:
+    name: Build Android ARM64 wheels
+    runs-on: ubuntu-latest                 # NDK 在 Linux 上支持最好
+    steps:
+      - name: Checkout TA-Lib Python repo
+        uses: actions/checkout@v5
+        with:
+          repository: mrjbq7/ta-lib        # TA-Lib Python 绑定的仓库
+          ref: v${{ env.TALIB_PY_VER }}    # 指定版本 tag
+
+      - name: Setup Python (host)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'           # 宿主 Python，用于运行交叉编译工具
+
+      - name: Install host dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install crossenv              # 用于创建交叉编译环境
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false                 # 我们不直接加 PATH，后面手动引用
+
+      - name: Download TA-Lib C source
+        run: |
+          wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-${{ env.TALIB_C_VER }}-src.tar.gz
+          tar -xzf ta-lib-${{ env.TALIB_C_VER }}-src.tar.gz
+
+      - name: Compile TA-Lib C library for Android
+        run: |
+          cd ta-lib-${{ env.TALIB_C_VER }}
+          
+          # 设置 NDK 工具链环境变量
+          export NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          export CC=$NDK_TOOLCHAIN/bin/${{ env.TARGET }}${{ env.API_LEVEL }}-clang
+          export AR=$NDK_TOOLCHAIN/bin/llvm-ar
+          export RANLIB=$NDK_TOOLCHAIN/bin/llvm-ranlib
+          export LD=$NDK_TOOLCHAIN/bin/ld
+          export CFLAGS="-fPIC -O2"
+          export LDFLAGS="-fPIC"
+
+          # 配置、编译并安装到临时目录
+          ./configure --host=${{ env.TARGET }} \
+                      --prefix=$PWD/install \
+                      --enable-shared=no \   # 生成静态库，避免动态库依赖问题
+                      --enable-static=yes
+          make
+          make install
+
+      - name: Create Python cross compilation environment
+        run: |
+          # 创建并激活交叉编译环境
+          python -m crossenv ${{ env.TARGET }} venv-cross
+          . venv-cross/bin/activate
+          pip install --upgrade pip setuptools wheel
+
+      - name: Build TA-Lib Python wheel for Android
+        run: |
+          . venv-cross/bin/activate
+
+          # 设置 TA-Lib C 库的路径（指向刚刚编译好的静态库和头文件）
+          export TA_LIBRARY_PATH=$GITHUB_WORKSPACE/ta-lib-${{ env.TALIB_C_VER }}/install/lib
+          export TA_INCLUDE_PATH=$GITHUB_WORKSPACE/ta-lib-${{ env.TALIB_C_VER }}/install/include
+
+          # 交叉编译时仍需指定编译器（crossenv 已设置好 CC 等环境变量，但可能需覆盖）
+          # crossenv 会自动将 CC 指向交叉编译器，但这里我们显式确认
+          export CC=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ env.TARGET }}${{ env.API_LEVEL }}-clang
+          export LDSHARED="$CC -shared"      # 用于构建共享扩展模块
+
+          # 构建 wheel，指定平台名为 linux_aarch64（Android 兼容的 Linux 平台）
+          python setup.py bdist_wheel --plat-name linux_aarch64
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          path: dist/*.whl
+          name: wheels-android-arm64
